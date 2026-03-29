@@ -1,0 +1,1376 @@
+#define _CRT_SECURE_NO_WARNINGS
+
+
+#include <iostream>
+
+
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+#include <fstream>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <random>
+#include <stdexcept>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <functional>
+#include <limits>
+
+// 引入Eigen3矩阵库（核心：实现真正的正规方程）
+#include <eigen3/Eigen/Dense>  // 修正：使用通用路径
+
+using namespace std;
+using namespace Eigen;
+
+// ============================================
+// 全局配置与工具宏
+// ============================================
+// 日志宏（带时间戳，统一输出格式）
+#define LOG_INFO(msg)  cout << "[" << getCurrentTime() << "] [INFO]  " << msg << endl
+#define LOG_WARN(msg)  cout << "[" << getCurrentTime() << "] [WARN]  " << msg << endl
+#define LOG_ERROR(msg) cerr << "[" << getCurrentTime() << "] [ERROR] " << msg << endl
+
+// 随机数种子（固定种子保证实验可复现，可修改）
+const unsigned int RANDOM_SEED = 12345;
+
+// 获取当前时间戳（日志用）
+inline string getCurrentTime() {
+    auto now = chrono::system_clock::now();
+    time_t t = chrono::system_clock::to_time_t(now);
+    tm tm = *localtime(&t);
+    stringstream ss;
+    ss << setw(2) << setfill('0') << tm.tm_hour << ":"
+        << setw(2) << setfill('0') << tm.tm_min << ":"
+        << setw(2) << setfill('0') << tm.tm_sec;
+    return ss.str();
+}
+
+// 浮点数比较（避免精度问题）
+inline bool isZero(double x, double eps = 1e-8) {
+    return fabs(x) < eps;
+}
+
+// ============================================
+// 数据结构定义
+// ============================================
+/**
+ * @brief 数据点类，表示单个样本数据
+ * @details 包含特征向量和目标值，框架基础数据单元
+ */
+class DataPoint {
+public:
+    vector<double> features;  // 特征向量
+    double target;            // 目标值（因变量）
+
+    DataPoint(const vector<double>& feat, double tgt) : features(feat), target(tgt) {}
+};
+
+// ============================================
+// 数据预处理类（核心新增：Z-Score标准化）
+// ============================================
+/**
+ * @brief 数据预处理工具类，实现Z-Score标准化
+ * @details 标准化公式：x' = (x - μ) / σ，测试集使用训练集的μ和σ（避免数据泄露）
+ */
+class Preprocessor {
+private:
+    vector<double> featMeans;   // 特征均值（训练集拟合）
+    vector<double> featStds;    // 特征标准差（训练集拟合）
+    bool isFitted;              // 拟合状态
+
+public:
+    Preprocessor() : isFitted(false) {}
+
+    /**
+     * @brief 拟合训练集，计算特征均值和标准差
+     * @param data 训练数据集
+     */
+    void fit(const vector<DataPoint>& data) {
+        if (data.empty()) {
+            throw invalid_argument("拟合数据不能为空");
+        }
+        size_t nFeat = data[0].features.size();
+        featMeans.assign(nFeat, 0.0);
+        featStds.assign(nFeat, 0.0);
+
+        // 计算均值
+        for (const auto& point : data) {
+            for (size_t i = 0; i < nFeat; ++i) {
+                featMeans[i] += point.features[i];
+            }
+        }
+        for (auto& mean : featMeans) {
+            mean /= data.size();
+        }
+
+        // 计算标准差
+        for (const auto& point : data) {
+            for (size_t i = 0; i < nFeat; ++i) {
+                featStds[i] += pow(point.features[i] - featMeans[i], 2);
+            }
+        }
+        for (size_t i = 0; i < nFeat; ++i) {
+            featStds[i] = sqrt(featStds[i] / data.size());
+            // 除零保护：特征标准差为0（所有样本值相同），设为1避免除零
+            if (isZero(featStds[i])) {
+                featStds[i] = 1.0;
+                LOG_WARN("特征" + to_string(i) + "标准差为0，标准化时将跳过（设σ=1）");
+            }
+        }
+
+        isFitted = true;
+        LOG_INFO("数据预处理拟合完成，特征数：" << nFeat);
+    }
+
+    /**
+     * @brief 对数据集进行标准化转换
+     * @param data 待转换数据集（训练/测试/预测数据）
+     * @return 标准化后的数据集
+     */
+    vector<DataPoint> transform(const vector<DataPoint>& data) const {
+        if (!isFitted) {
+            throw runtime_error("预处理尚未拟合训练集");
+        }
+        if (data.empty()) return {};
+
+        vector<DataPoint> transformed;
+        size_t nFeat = featMeans.size();
+        for (const auto& point : data) {
+            if (point.features.size() != nFeat) {
+                throw invalid_argument("特征维度不匹配（拟合时：" + to_string(nFeat) + "，当前：" + to_string(point.features.size()) + "）");
+            }
+            vector<double> newFeat(nFeat);
+            for (size_t i = 0; i < nFeat; ++i) {
+                newFeat[i] = (point.features[i] - featMeans[i]) / featStds[i];
+            }
+            transformed.emplace_back(newFeat, point.target);
+        }
+
+        LOG_INFO("数据标准化完成，处理样本数：" << transformed.size());
+        return transformed;
+    }
+
+    /**
+     * @brief 对单个特征向量标准化（预测时用）
+     * @param features 原始特征向量
+     * @return 标准化后的特征向量
+     */
+    vector<double> transformSingle(const vector<double>& features) const {
+        if (!isFitted) {
+            throw runtime_error("预处理尚未拟合训练集");
+        }
+        if (features.size() != featMeans.size()) {
+            throw invalid_argument("特征维度不匹配");
+        }
+        vector<double> newFeat(features.size());
+        for (size_t i = 0; i < features.size(); ++i) {
+            newFeat[i] = (features[i] - featMeans[i]) / featStds[i];
+        }
+        return newFeat;
+    }
+
+    bool isFittedModel() const { return isFitted; }
+};
+
+// ============================================
+// 回归模型基类
+// ============================================
+class RegressionModel {
+protected:
+    vector<double> coefficients;  // 特征系数（权重）
+    double intercept;             // 截距项
+    bool trained;                 // 训练状态标志
+    Preprocessor preprocessor;    // 内置预处理对象
+
+public:
+    RegressionModel() : trained(false), intercept(0.0) {}
+    virtual ~RegressionModel() = default;
+
+    // 纯虚函数（子类必须实现）
+    virtual void train(const vector<DataPoint>& data, bool doNormalize = true) = 0;
+    virtual double predict(const vector<double>& features) const = 0;
+    virtual double score(const vector<DataPoint>& data) const = 0;
+    virtual double adjustedR2(const vector<DataPoint>& data) const = 0;  // 新增：调整R²
+
+    // 公共方法
+    vector<double> getCoefficients() const { return coefficients; }
+    double getIntercept() const { return intercept; }
+    bool isTrained() const { return trained; }
+    const Preprocessor& getPreprocessor() const { return preprocessor; }
+
+protected:
+    // 工具方法：提取特征矩阵和目标向量
+    vector<vector<double>> extractFeaturesMatrix(const vector<DataPoint>& data) const {
+        vector<vector<double>> matrix;
+        for (const auto& point : data) matrix.push_back(point.features);
+        return matrix;
+    }
+
+    vector<double> extractTargets(const vector<DataPoint>& data) const {
+        vector<double> targets;
+        for (const auto& point : data) targets.push_back(point.target);
+        return targets;
+    }
+
+    // 工具方法：将std::vector转换为Eigen矩阵（核心：正规方程用）
+    MatrixXd toEigenMatrix(const vector<vector<double>>& mat) const {
+        MatrixXd eigenMat(mat.size(), mat[0].size());
+        for (size_t i = 0; i < mat.size(); ++i) {
+            for (size_t j = 0; j < mat[0].size(); ++j) {
+                eigenMat(i, j) = mat[i][j];
+            }
+        }
+        return eigenMat;
+    }
+
+    VectorXd toEigenVector(const vector<double>& vec) const {
+        VectorXd eigenVec(vec.size());
+        for (size_t i = 0; i < vec.size(); ++i) {
+            eigenVec(i) = vec[i];
+        }
+        return eigenVec;
+    }
+};
+
+// ============================================
+// 线性回归模型（核心优化：正规方程+L2正则+梯度下降优化）
+// ============================================
+class LinearRegression : public RegressionModel {
+private:
+    // 配置参数（新增正则化、早停、学习率衰减）
+    bool useGradientDescent;
+    double learningRate;
+    int maxIterations;
+    double l2Lambda;          // L2正则化系数（岭回归），0=普通线性回归
+    int earlyStopPatience;    // 早停耐心值：连续n轮验证损失不下降则停止
+    double lrDecay;           // 学习率衰减率：lr = lr * decay per 100 iter
+
+    // 早停辅助函数：划分训练集/验证集（8:2）
+    pair<vector<DataPoint>, vector<DataPoint>> trainValSplit(const vector<DataPoint>& data) const {
+        size_t splitIdx = data.size() * 0.8;
+        vector<DataPoint> train(data.begin(), data.begin() + splitIdx);
+        vector<DataPoint> val(data.begin() + splitIdx, data.end());
+        return { train, val };
+    }
+
+    // 计算均方损失（带L2正则）
+    double calculateLoss(const vector<DataPoint>& data) const {
+        double loss = 0.0;
+        size_t n = data.size();
+        for (const auto& point : data) {
+            double pred = predict(point.features);
+            loss += pow(pred - point.target, 2);
+        }
+        loss /= (2 * n);
+        // 添加L2正则项（不惩罚截距）
+        double l2Penalty = 0.0;
+        for (double c : coefficients) l2Penalty += c * c;
+        loss += 0.5 * l2Lambda * l2Penalty / n;
+        return loss;
+    }
+
+public:
+    /**
+     * @brief 构造函数（新增正则化、早停、学习率衰减参数）
+     * @param useGD 是否使用梯度下降
+     * @param lr 初始学习率
+     * @param maxIter 最大迭代次数
+     * @param l2 正则化系数
+     * @param patience 早停耐心值
+     * @param decay 学习率衰减率
+     */
+    LinearRegression(bool useGD = false, double lr = 0.01, int maxIter = 2000,
+        double l2 = 0.001, int patience = 50, double decay = 0.95)
+        : useGradientDescent(useGD), learningRate(lr), maxIterations(maxIter),
+        l2Lambda(l2), earlyStopPatience(patience), lrDecay(decay) {
+        // 超参数校验（新增）
+        if (lr <= 0 || lr > 1) throw invalid_argument("学习率必须在(0,1]之间");
+        if (maxIter <= 0) throw invalid_argument("最大迭代次数必须>0");
+        if (l2 < 0) throw invalid_argument("正则化系数不能为负");
+        if (patience <= 0) throw invalid_argument("早停耐心值必须>0");
+        if (decay <= 0 || decay > 1) throw invalid_argument("学习率衰减率必须在(0,1]之间");
+    }
+
+    // ============================================
+    // 核心优化：实现真正的正规方程（带L2正则）
+    // 公式：β = (X^T X + λI)⁻¹ X^T y （I为单位矩阵，避免X^T X奇异）
+    // ============================================
+    void trainNormalEquation(const vector<DataPoint>& data) {
+        LOG_INFO("使用正规方程训练（带L2正则，λ=" << l2Lambda << "）");
+        auto featuresMat = extractFeaturesMatrix(data);
+        auto targetsVec = extractTargets(data);
+        size_t nSamples = data.size();
+        size_t nFeats = featuresMat[0].size();
+
+        // 转换为Eigen矩阵
+        MatrixXd X = toEigenMatrix(featuresMat);
+        VectorXd y = toEigenVector(targetsVec);
+
+        // 构造X^T X + λI（带正则化的协方差矩阵）
+        MatrixXd XtX = X.transpose() * X;
+        MatrixXd regTerm = l2Lambda * MatrixXd::Identity(nFeats, nFeats);  // L2正则项
+        XtX += regTerm;
+
+        // 构造X^T y
+        VectorXd Xty = X.transpose() * y;
+
+        // 求解：β = (XtX)⁻¹ Xty （Eigen的colPivHouseholderQr处理奇异矩阵，鲁棒性强）
+        VectorXd beta = XtX.colPivHouseholderQr().solve(Xty);
+
+        // 赋值系数和截距（正规方程需手动计算截距：μ_y - β^T μ_x）
+        double yMean = targetsVec.empty() ? 0 : accumulate(targetsVec.begin(), targetsVec.end(), 0.0) / nSamples;
+        VectorXd xMean(nFeats);
+        for (size_t i = 0; i < nFeats; ++i) {
+            double sum = 0;
+            for (const auto& f : featuresMat) sum += f[i];
+            xMean(i) = sum / nSamples;
+        }
+        intercept = yMean - beta.dot(xMean);
+        coefficients.assign(beta.data(), beta.data() + beta.size());
+
+        LOG_INFO("正规方程训练完成，系数数：" << coefficients.size() << "，截距：" << fixed << setprecision(6) << intercept);
+    }
+
+
+    // ============================================
+    // 核心优化：梯度下降（批量+早停+学习率衰减+L2正则）
+    // ============================================
+    void trainGradientDescent(const vector<DataPoint>& data) {
+        LOG_INFO("使用梯度下降训练（批量BGD，λ=" << l2Lambda << "，早停耐心值=" << earlyStopPatience << "）");
+
+        // 获取特征数量
+        size_t nFeats = data[0].features.size();
+
+        // 划分训练/验证集（早停用）- 修正：不使用结构化绑定
+        auto trainValPair = trainValSplit(data);
+        vector<DataPoint> trainData = trainValPair.first;
+        vector<DataPoint> valData = trainValPair.second;
+
+        size_t nTrain = trainData.size();
+        double currentLr = learningRate;
+        double bestValLoss = numeric_limits<double>::max();
+        int noImproveCount = 0;
+
+        LOG_INFO("训练集样本：" << nTrain << "，验证集样本：" << valData.size() << "，初始学习率：" << currentLr);
+
+        for (int iter = 0; iter < maxIterations; ++iter) {
+            // 学习率衰减：每100次迭代衰减一次
+            if ((iter + 1) % 100 == 0) {
+                currentLr *= lrDecay;
+                LOG_INFO("迭代" << iter + 1 << "，学习率衰减为：" << fixed << setprecision(6) << currentLr);
+            }
+
+            // 计算梯度（带L2正则）
+            vector<double> gradCoeff(nFeats, 0.0);
+            double gradIntercept = 0.0;
+            for (const auto& point : trainData) {
+                double pred = intercept;
+                for (size_t i = 0; i < nFeats; ++i) pred += coefficients[i] * point.features[i];
+                double error = pred - point.target;
+
+                gradIntercept += error;
+                for (size_t i = 0; i < nFeats; ++i) {
+                    gradCoeff[i] += error * point.features[i] + l2Lambda * coefficients[i];  // 带L2正则的梯度
+                }
+            }
+
+            // 批量梯度下降更新（平均梯度）
+            intercept -= currentLr * gradIntercept / nTrain;
+            for (size_t i = 0; i < nFeats; ++i) {
+                coefficients[i] -= currentLr * gradCoeff[i] / nTrain;
+            }
+
+            // 早停机制：监控验证集损失
+            if (iter % 10 == 0) {  // 每10轮检查一次，提升效率
+                double valLoss = calculateLoss(valData);
+                if (valLoss < bestValLoss - 1e-8) {  // 损失下降（容差1e-8）
+                    bestValLoss = valLoss;
+                    noImproveCount = 0;
+                }
+                else {
+                    noImproveCount++;
+                    if (noImproveCount >= earlyStopPatience) {
+                        LOG_INFO("早停触发：迭代" << iter + 1 << "，验证损失连续" << earlyStopPatience << "轮未下降，最佳验证损失：" << fixed << setprecision(6) << bestValLoss);
+                        break;
+                    }
+                }
+
+                // 打印训练损失（每100轮）
+                if ((iter + 1) % 100 == 0) {
+                    double trainLoss = calculateLoss(trainData);
+                    LOG_INFO("迭代" << iter + 1 << "，训练损失：" << fixed << setprecision(6) << trainLoss << "，验证损失：" << valLoss);
+                }
+            }
+
+            // 损失收敛判断：训练损失小于1e-6则停止
+            double trainLoss = calculateLoss(trainData);
+            if (trainLoss < 1e-6) {
+                LOG_INFO("训练收敛：迭代" << iter + 1 << "，训练损失<1e-6");
+                break;
+            }
+        }
+
+        LOG_INFO("梯度下降训练完成，最终系数数：" << coefficients.size() << "，截距：" << fixed << setprecision(6) << intercept);
+    }
+
+    // ============================================
+    // 重写训练方法（新增标准化开关）
+    // ============================================
+    void train(const vector<DataPoint>& data, bool doNormalize = true) override {
+        if (data.empty()) {
+            LOG_ERROR("训练数据不能为空");
+            throw invalid_argument("训练数据不能为空");
+        }
+        size_t nFeats = data[0].features.size();
+        coefficients.assign(nFeats, 0.0);
+        intercept = 0.0;
+
+        // 数据标准化（梯度下降强制标准化，正规方程可选）
+        vector<DataPoint> trainData = data;
+        if (doNormalize || useGradientDescent) {
+            preprocessor.fit(data);
+            trainData = preprocessor.transform(data);
+        }
+        else {
+            LOG_WARN("正规方程未使用标准化，建议对量纲差异大的特征进行预处理");
+        }
+        // ==================== 修复开始 ====================
+        trained = true;   // ←←←←← 关键修复：让梯度下降内部验证能正常调用 predict
+        // ==================== 修复结束 ====================
+        // 选择训练方法
+        if (useGradientDescent) {
+            trainGradientDescent(trainData);
+        }
+        else {
+            trainNormalEquation(trainData);
+        }
+
+        trained = true;
+        LOG_INFO("线性回归模型训练完成，训练状态：已就绪");
+    }
+
+    // ============================================
+    // 重写预测方法（自动适配标准化）
+    // ============================================
+    double predict(const vector<double>& features) const override {
+        if (!trained) {
+            LOG_ERROR("模型尚未训练，无法预测");
+            throw runtime_error("模型尚未训练");
+        }
+        if (features.size() != coefficients.size()) {
+            LOG_ERROR("特征维度不匹配（模型：" << coefficients.size() << "，输入：" << features.size() << "）");
+            throw invalid_argument("特征维度不匹配");
+        }
+
+        // 若已标准化，先转换特征
+        vector<double> feat = features;
+        if (preprocessor.isFittedModel()) {
+            feat = preprocessor.transformSingle(features);
+        }
+
+        // 线性预测：y = intercept + Σ(coefficient_i * feat_i)
+        double pred = intercept;
+        for (size_t i = 0; i < feat.size(); ++i) {
+            pred += coefficients[i] * feat[i];
+        }
+        return pred;
+    }
+
+    // ============================================
+    // 重写评分方法（基础R²）
+    // ============================================
+    double score(const vector<DataPoint>& data) const override {
+        if (!trained || data.empty()) return 0.0;
+        double meanTarget = 0.0;
+        for (const auto& p : data) meanTarget += p.target;
+        meanTarget /= data.size();
+
+        double totalSS = 0.0, residualSS = 0.0;
+        for (const auto& p : data) {
+            double pred = predict(p.features);
+            totalSS += pow(p.target - meanTarget, 2);
+            residualSS += pow(p.target - pred, 2);
+        }
+
+        return isZero(totalSS) ? 0.0 : 1.0 - (residualSS / totalSS);
+    }
+
+    // ============================================
+    // 新增：调整R²（修正多特征R²虚高问题）
+    // 公式：R²_adj = 1 - (1-R²)*(n-1)/(n-p-1) （p为特征数，n为样本数）
+    // ============================================
+    double adjustedR2(const vector<DataPoint>& data) const override {
+        if (!trained || data.empty() || data.size() <= coefficients.size() + 1) return 0.0;
+        double r2 = score(data);
+        size_t n = data.size();
+        size_t p = coefficients.size();
+        return 1.0 - (1.0 - r2) * (n - 1) / (n - p - 1);
+    }
+};
+
+// ============================================
+// 多项式回归模型（核心优化：支持交叉项的全多项式特征）
+// ============================================
+class PolynomialRegression : public RegressionModel {
+private:
+    int degree;
+    LinearRegression linearModel;  // 内部线性模型（复用所有优化）
+
+    // 核心优化：生成全多项式特征（含交叉项，如x1*x2, x1²*x2等）
+    vector<double> generatePolyFeatures(const vector<double>& features) const {
+        vector<double> polyFeat = { 1.0 };  // 常数项（避免截距重复）
+        int n = features.size();
+
+        // 修正：添加明确的返回类型 -> void
+        function<void(int, int, double)> combine = [&](int start, int currDeg, double prod) -> void {
+            if (currDeg == 0) {
+                polyFeat.push_back(prod);
+                return;
+            }
+            for (int i = start; i < n; ++i) {
+                combine(i, currDeg - 1, prod * features[i]);
+            }
+            };
+
+        for (int d = 1; d <= degree; ++d) {
+            combine(0, d, 1.0);
+        }
+
+        polyFeat.erase(polyFeat.begin());  // 移除常数项
+        return polyFeat;
+    }
+
+    // 转换单个数据点
+    DataPoint transformSinglePoint(const DataPoint& point) const {
+        vector<double> polyFeat = generatePolyFeatures(point.features);
+        return DataPoint(polyFeat, point.target);
+    }
+
+public:
+    PolynomialRegression(int deg = 2, double l2Lambda = 0.001) : degree(deg), linearModel(false, 0.01, 2000, l2Lambda) {
+        if (deg < 1) {
+            LOG_ERROR("多项式次数必须≥1，当前输入：" << deg);
+            throw invalid_argument("多项式次数必须至少为1");
+        }
+        LOG_INFO("初始化多项式回归模型，阶数：" << deg << "，L2正则化系数：" << l2Lambda);
+    }
+
+    // 训练：特征变换+线性模型训练（复用标准化、正则化等所有优化）
+    void train(const vector<DataPoint>& data, bool doNormalize = true) override {
+        if (data.empty()) {
+            LOG_ERROR("多项式回归训练数据不能为空");
+            throw invalid_argument("数据不能为空");
+        }
+
+        // 多项式特征变换
+        vector<DataPoint> polyData;
+        polyData.reserve(data.size());  // 优化：预分配内存
+        for (const auto& p : data) {
+            polyData.push_back(transformSinglePoint(p));
+        }
+        LOG_INFO("多项式特征变换完成，原始特征数：" << data[0].features.size() << "，变换后特征数：" << polyData[0].features.size());
+
+        // 训练内部线性模型（复用所有优化）
+        linearModel.train(polyData, doNormalize);
+
+        // 同步训练状态和预处理对象
+        trained = true;
+        coefficients = linearModel.getCoefficients();
+        intercept = linearModel.getIntercept();
+        preprocessor = linearModel.getPreprocessor();
+
+        LOG_INFO("多项式回归模型训练完成");
+    }
+
+    // 预测：特征变换+线性模型预测
+    double predict(const vector<double>& features) const override {
+        if (!trained) {
+            LOG_ERROR("多项式回归模型尚未训练");
+            throw runtime_error("模型尚未训练");
+        }
+        vector<double> polyFeat = generatePolyFeatures(features);
+        return linearModel.predict(polyFeat);
+    }
+
+    // 基础R²（复用线性模型）
+    double score(const vector<DataPoint>& data) const override {
+        if (!trained) return 0.0;
+        vector<DataPoint> polyData;
+        polyData.reserve(data.size());  // 优化：预分配内存
+        for (const auto& p : data) polyData.push_back(transformSinglePoint(p));
+        return linearModel.score(polyData);
+    }
+
+    // 调整R²（复用线性模型）
+    double adjustedR2(const vector<DataPoint>& data) const override {
+        if (!trained) return 0.0;
+        vector<DataPoint> polyData;
+        polyData.reserve(data.size());  // 优化：预分配内存
+        for (const auto& p : data) polyData.push_back(transformSinglePoint(p));
+        return linearModel.adjustedR2(polyData);
+    }
+};
+
+// ============================================
+
+// Logistic回归模型（二分类专用：sigmoid + 交叉熵损失 + L2正则 + 早停）
+
+// ============================================
+
+class LogisticRegression : public RegressionModel {
+
+private:
+
+    double learningRate;
+
+    int maxIterations;
+
+    double l2Lambda;
+
+    int earlyStopPatience;
+
+    double lrDecay;
+
+    // 训练/验证集划分（8:2）
+
+    pair<vector<DataPoint>, vector<DataPoint>> trainValSplit(const vector<DataPoint>& data) const {
+
+        size_t splitIdx = data.size() * 0.8;
+
+        vector<DataPoint> train(data.begin(), data.begin() + splitIdx);
+
+        vector<DataPoint> val(data.begin() + splitIdx, data.end());
+
+        return { train, val };
+
+    }
+
+    double sigmoid(double z) const {
+
+        return 1.0 / (1.0 + exp(-z));
+
+    }
+
+    // 交叉熵损失（带L2正则，防log(0)）
+
+    double calculateLoss(const vector<DataPoint>& data) const {
+
+        double loss = 0.0;
+
+        size_t n = data.size();
+
+        for (const auto& point : data) {
+
+            double z = intercept;
+
+            for (size_t i = 0; i < coefficients.size(); ++i) z += coefficients[i] * point.features[i];
+
+            double p = sigmoid(z);
+
+            double y = point.target;
+
+            loss -= (y * log(p + 1e-15) + (1 - y) * log(1 - p + 1e-15));
+
+        }
+
+        loss /= n;
+
+        double l2Penalty = 0.0;
+
+        for (double c : coefficients) l2Penalty += c * c;
+
+        loss += 0.5 * l2Lambda * l2Penalty / n;
+
+        return loss;
+
+    }
+
+public:
+
+    LogisticRegression(double lr = 0.01, int maxIter = 2000, double l2 = 0.001,
+
+        int patience = 50, double decay = 0.95)
+
+        : learningRate(lr), maxIterations(maxIter), l2Lambda(l2),
+
+        earlyStopPatience(patience), lrDecay(decay) {
+
+    }
+
+    void train(const vector<DataPoint>& data, bool doNormalize = true) override {
+
+        if (data.empty()) throw invalid_argument("训练数据不能为空");
+
+        size_t nFeats = data[0].features.size();
+
+        coefficients.assign(nFeats, 0.0);
+
+        intercept = 0.0;
+
+        vector<DataPoint> trainData = data;
+
+        if (doNormalize) {
+
+            preprocessor.fit(data);
+
+            trainData = preprocessor.transform(data);
+
+        }
+
+        LOG_INFO("使用梯度下降训练Logistic回归（L2λ=" << l2Lambda << "，早停耐心值=" << earlyStopPatience << "）");
+
+        auto trainValPair = trainValSplit(trainData);
+
+        vector<DataPoint> tr = trainValPair.first;
+
+        vector<DataPoint> val = trainValPair.second;
+
+        size_t nTrain = tr.size();
+
+        double currentLr = learningRate;
+
+        double bestValLoss = numeric_limits<double>::max();
+
+        int noImproveCount = 0;
+
+        for (int iter = 0; iter < maxIterations; ++iter) {
+
+            if ((iter + 1) % 100 == 0) currentLr *= lrDecay;
+
+            vector<double> gradCoeff(nFeats, 0.0);
+
+            double gradIntercept = 0.0;
+
+            for (const auto& point : tr) {
+
+                double z = intercept;
+
+                for (size_t i = 0; i < nFeats; ++i) z += coefficients[i] * point.features[i];
+
+                double p = sigmoid(z);
+
+                double error = p - point.target;
+
+                gradIntercept += error;
+
+                for (size_t i = 0; i < nFeats; ++i) {
+
+                    gradCoeff[i] += error * point.features[i] + l2Lambda * coefficients[i];
+
+                }
+
+            }
+
+            intercept -= currentLr * gradIntercept / nTrain;
+
+            for (size_t i = 0; i < nFeats; ++i) {
+
+                coefficients[i] -= currentLr * gradCoeff[i] / nTrain;
+
+            }
+
+            if (iter % 10 == 0) {
+
+                double valLoss = calculateLoss(val);
+
+                if (valLoss < bestValLoss - 1e-8) {
+
+                    bestValLoss = valLoss;
+
+                    noImproveCount = 0;
+
+                }
+
+                else {
+
+                    noImproveCount++;
+
+                    if (noImproveCount >= earlyStopPatience) {
+
+                        LOG_INFO("早停触发：迭代" << iter + 1);
+
+                        break;
+
+                    }
+
+                }
+
+            }
+
+            if (calculateLoss(tr) < 1e-6) break;
+
+        }
+
+        trained = true;
+
+        LOG_INFO("Logistic回归训练完成，截距：" << fixed << setprecision(6) << intercept);
+
+    }
+
+    double predict(const vector<double>& features) const override {
+
+        if (!trained) throw runtime_error("模型尚未训练");
+
+        vector<double> feat = features;
+
+        if (preprocessor.isFittedModel()) feat = preprocessor.transformSingle(features);
+
+        double z = intercept;
+
+        for (size_t i = 0; i < feat.size(); ++i) z += coefficients[i] * feat[i];
+
+        return sigmoid(z);
+
+    }
+
+    double score(const vector<DataPoint>& data) const override {
+
+        if (!trained || data.empty()) return 0.0;
+
+        int correct = 0;
+
+        for (const auto& p : data) {
+
+            double prob = predict(p.features);
+
+            int pred = (prob >= 0.5) ? 1 : 0;
+
+            if (pred == static_cast<int>(round(p.target))) correct++;
+
+        }
+
+        return static_cast<double>(correct) / data.size();
+
+    }
+
+    double adjustedR2(const vector<DataPoint>& data) const override { return 0.0; }
+
+};
+// ============================================
+// 数据加载器（核心优化：支持跳过表头、更鲁棒的解析）
+// ============================================
+class DataLoader {
+public:
+    // 加载CSV（新增：skipHeader是否跳过表头）
+    static vector<DataPoint> loadCSV(const string& filename, char delimiter = ',', bool skipHeader = false) {
+        vector<DataPoint> data;
+        ifstream file(filename);
+        if (!file.is_open()) {
+            LOG_ERROR("无法打开CSV文件：" << filename);
+            throw runtime_error("无法打开文件: " + filename);
+        }
+
+        string line;
+        int lineNum = 0;
+        // 跳过表头
+        if (skipHeader && getline(file, line)) {
+            LOG_INFO("跳过CSV表头行：" << line);
+            lineNum++;
+        }
+
+        while (getline(file, line)) {
+            lineNum++;
+            stringstream ss(line);
+            string cell;
+            vector<double> features;
+            double target;
+            bool isFirst = true;
+
+            while (getline(ss, cell, delimiter)) {
+                // 去除单元格前后空格（鲁棒性优化）
+                cell.erase(remove_if(cell.begin(), cell.end(), ::isspace), cell.end());
+                if (cell.empty()) continue;
+
+                try {
+                    double val = stod(cell);
+                    if (isFirst) {
+                        target = val;
+                        isFirst = false;
+                    }
+                    else {
+                        features.push_back(val);
+                    }
+                }
+                catch (const invalid_argument&) {
+                    LOG_ERROR("CSV第" << lineNum << "行数据格式错误：" << cell);
+                    throw runtime_error("CSV文件第" + to_string(lineNum) + "行数据格式错误: " + cell);
+                }
+                catch (const out_of_range&) {
+                    LOG_ERROR("CSV第" << lineNum << "行数据超出范围：" << cell);
+                    throw runtime_error("CSV文件第" + to_string(lineNum) + "行数据超出范围: " + cell);
+                }
+            }
+
+            if (!isFirst && !features.empty()) {  // 至少有目标值和一个特征
+                data.emplace_back(features, target);
+            }
+            else {
+                LOG_WARN("CSV第" << lineNum << "行数据无效，跳过（无特征或目标值）");
+            }
+        }
+
+        LOG_INFO("从CSV加载完成：" << filename << "，有效样本数：" << data.size());
+        return data;
+    }
+
+    // 生成随机数据（优化：固定种子，可复现）
+    static vector<DataPoint> generateRandomData(int nSamples, int nFeatures) {
+        if (nSamples <= 0 || nFeatures <= 0) {
+            LOG_ERROR("无效的样本数/特征数：" << nSamples << "/" << nFeatures);
+            throw invalid_argument("样本数和特征数必须>0");
+        }
+
+        mt19937 gen(RANDOM_SEED);  // 固定种子，可复现
+        uniform_real_distribution<> featDist(-10.0, 10.0);
+        normal_distribution<> noiseDist(0.0, 0.5);
+
+        // 生成真实参数（缩小范围，便于模型学习）
+        vector<double> trueCoeffs(nFeatures);
+        for (auto& c : trueCoeffs) c = featDist(gen) / 5.0;
+        double trueIntercept = featDist(gen) / 5.0;
+
+        // 打印真实参数（验证模型）
+        LOG_INFO("\n【真实模型参数（用于验证）】");
+        LOG_INFO("截距：" << fixed << setprecision(6) << trueIntercept);
+        for (int i = 0; i < nFeatures; ++i) {
+            LOG_INFO("特征" << i << "系数：" << fixed << setprecision(6) << trueCoeffs[i]);
+        }
+
+        // 生成数据
+        vector<DataPoint> data;
+        for (int i = 0; i < nSamples; ++i) {
+            vector<double> features(nFeatures);
+            double y = trueIntercept;
+            for (int j = 0; j < nFeatures; ++j) {
+                features[j] = featDist(gen);
+                y += trueCoeffs[j] * features[j];
+            }
+            y += noiseDist(gen);  // 加高斯噪声
+            data.emplace_back(features, y);
+        }
+
+        LOG_INFO("生成模拟数据完成，样本数：" << nSamples << "，特征数：" << nFeatures);
+        return data;
+    }
+
+    // 保存CSV（优化：格式化输出，保留6位小数）
+    static void saveToCSV(const vector<DataPoint>& data, const string& filename, char delimiter = ',') {
+        ofstream file(filename);
+        if (!file.is_open()) {
+            LOG_ERROR("无法创建CSV文件：" << filename);
+            throw runtime_error("无法创建文件: " + filename);
+        }
+
+        file << fixed << setprecision(6);
+        for (const auto& point : data) {
+            file << point.target;
+            for (double f : point.features) {
+                file << delimiter << f;
+            }
+            file << endl;
+        }
+
+        LOG_INFO("数据保存到CSV完成：" << filename << "，样本数：" << data.size());
+    }
+};
+
+// ============================================
+// 模型评估器（核心优化：新增调整R²、MAPE、更详细的残差分析）
+// ============================================
+class RegressionEvaluator {
+public:
+    struct EvaluationMetrics {
+        double mse;           // 均方误差
+        double rmse;          // 均方根误差
+        double mae;           // 平均绝对误差
+        double mape;          // 平均绝对百分比误差（新增）
+        double r2;            // 基础R²
+        double adjR2;         // 调整R²（新增）
+        vector<double> residuals;  // 残差（预测-真实）
+
+        EvaluationMetrics() : mse(0), rmse(0), mae(0), mape(0), r2(0), adjR2(0) {}
+    };
+
+    // 评估模型（新增调整R²、MAPE）
+    static EvaluationMetrics evaluate(const RegressionModel& model, const vector<DataPoint>& testData) {
+        EvaluationMetrics metrics;
+        if (testData.empty() || !model.isTrained()) {
+            LOG_WARN("评估数据为空或模型未训练，返回空指标");
+            return metrics;
+        }
+
+        double sumSqError = 0.0, sumAbsError = 0.0, sumAbsPctError = 0.0;
+        double sumTarget = 0.0;
+        size_t n = testData.size();
+
+        for (const auto& point : testData) {
+            double pred = model.predict(point.features);
+            double error = pred - point.target;
+            double target = point.target;
+
+            metrics.residuals.push_back(error);
+            sumSqError += error * error;
+            sumAbsError += fabs(error);
+            sumTarget += target;
+
+            // MAPE计算：避免除零（目标值为0时跳过）
+            if (!isZero(target)) {
+                sumAbsPctError += fabs(error / target);
+            }
+        }
+
+        // 基础误差指标
+        double meanTarget = sumTarget / n;
+        metrics.mse = sumSqError / n;
+        metrics.rmse = sqrt(metrics.mse);
+        metrics.mae = sumAbsError / n;
+        metrics.mape = (sumAbsPctError / n) * 100.0;  // 转换为百分比
+
+        // R²和调整R²
+        metrics.r2 = model.score(testData);
+        metrics.adjR2 = model.adjustedR2(testData);
+
+        // 总平方和验证
+        double totalSS = 0.0;
+        for (const auto& point : testData) {
+            totalSS += pow(point.target - meanTarget, 2);
+        }
+        if (isZero(totalSS)) {
+            metrics.r2 = 0.0;
+            metrics.adjR2 = 0.0;
+            LOG_WARN("目标值无波动（总平方和为0），R²和调整R²置0");
+        }
+
+        return metrics;
+    }
+
+    // 打印评估指标（新增调整R²、MAPE，拟合效果判断基于调整R²）
+    static void printMetrics(const EvaluationMetrics& metrics) {
+        cout << "\n==================================== 模型评估结果 ====================================" << endl;
+        cout << fixed << setprecision(6);
+        cout << "均方误差 (MSE)：    " << setw(15) << metrics.mse << endl;
+        cout << "均方根误差 (RMSE)： " << setw(15) << metrics.rmse << endl;
+        cout << "平均绝对误差 (MAE)：" << setw(15) << metrics.mae << endl;
+        cout << "平均绝对百分比误差(MAPE, %)：" << setw(10) << metrics.mape << endl;
+        cout << "基础决定系数 (R²)： " << setw(15) << metrics.r2 << endl;
+        cout << "调整决定系数 (R²_adj)：" << setw(12) << metrics.adjR2 << " （推荐参考，修正多特征虚高）" << endl;
+        cout << "=====================================================================================" << endl;
+
+        // 基于调整R²判断拟合效果
+        cout << "模型拟合效果：";
+        if (metrics.adjR2 > 0.9) {
+            cout << "优秀 (R²_adj > 0.9)" << endl;
+        }
+        else if (metrics.adjR2 > 0.7) {
+            cout << "良好 (0.7 < R²_adj ≤ 0.9)" << endl;
+        }
+        else if (metrics.adjR2 > 0.5) {
+            cout << "一般 (0.5 < R²_adj ≤ 0.7)" << endl;
+        }
+        else {
+            cout << "较差 (R²_adj ≤ 0.5)，建议调整模型（如多项式阶数、正则化系数）" << endl;
+        }
+    }
+
+    // 残差分析（优化：更详细的统计，新增正态性简单判断）
+    static void analyzeResiduals(const EvaluationMetrics& metrics) {
+        if (metrics.residuals.empty()) {
+            LOG_WARN("无残差数据可分析");
+            return;
+        }
+
+        double sumRes = 0.0, sumSqRes = 0.0;
+        double minRes = *min_element(metrics.residuals.begin(), metrics.residuals.end());
+        double maxRes = *max_element(metrics.residuals.begin(), metrics.residuals.end());
+        for (double r : metrics.residuals) {
+            sumRes += r;
+            sumSqRes += r * r;
+        }
+
+        size_t n = metrics.residuals.size();
+        double meanRes = sumRes / n;
+        double varRes = sumSqRes / n - meanRes * meanRes;
+        double stdRes = sqrt(varRes > 0 ? varRes : 0);
+
+        cout << "\n==================================== 残差分析结果 ====================================" << endl;
+        cout << fixed << setprecision(4);
+        cout << "残差均值：" << setw(15) << meanRes << " （理想值：0，越小越好）" << endl;
+        cout << "残差标准差：" << setw(13) << stdRes << endl;
+        cout << "最小残差：" << setw(15) << minRes << endl;
+        cout << "最大残差：" << setw(15) << maxRes << endl;
+        cout << "残差范围：" << setw(15) << (maxRes - minRes) << endl;
+        cout << "=====================================================================================" << endl;
+
+        // 残差分析结论（理想：均值接近0，95%残差在±2σ内）
+        int inRange = 0;
+        double threshold = 2 * stdRes;
+        for (double r : metrics.residuals) {
+            if (fabs(r) <= threshold) inRange++;
+        }
+        double inRangePct = (static_cast<double>(inRange) / n) * 100.0;
+
+        cout << "残差分析结论：";
+        if (fabs(meanRes) < 0.1 && inRangePct >= 95.0) {
+            cout << "优秀！残差均值接近0，95%以上残差在±2σ内，符合正态分布假设" << endl;
+        }
+        else if (fabs(meanRes) < 0.2 && inRangePct >= 90.0) {
+            cout << "良好！残差分布基本符合要求，模型拟合效果较好" << endl;
+        }
+        else {
+            cout << "需改进！残差分布偏离正态假设（均值：" << meanRes << "，±2σ内占比：" << inRangePct << "%），建议检查模型或数据" << endl;
+        }
+    }
+};
+
+// ============================================
+// 主程序（保留原交互式流程，适配新增优化参数）
+// ============================================
+int main()
+{
+    cout << "==================================== C++ 数据回归分析系统 （优化版V2.0） ====================================" << endl;
+    cout << "核心优化：Eigen正规方程 | Z-Score标准化 | L2正则化 | 梯度下降早停 | 多项式交叉项 | 调整R² | 可复现随机" << endl;
+    cout << "============================================================================================================" << endl;
+
+    try {
+        // 第一步：准备数据
+        LOG_INFO("【第一步：数据准备】");
+        int dataSource;
+        cout << "\n请选择数据源：1-模拟数据  2-CSV文件 （默认1）：";
+        cin >> dataSource;
+        if (!(dataSource == 1 || dataSource == 2)) dataSource = 1;
+
+        vector<DataPoint> allData;
+        if (dataSource == 1) {
+            int nSamples = 200, nFeats = 3;
+            cout << "输入模拟数据样本数（默认200）：";
+            if (!(cin >> nSamples) || nSamples <= 0) nSamples = 200;
+            cout << "输入特征数（默认3）：";
+            if (!(cin >> nFeats) || nFeats <= 0) nFeats = 3;
+            allData = DataLoader::generateRandomData(nSamples, nFeats);
+
+            // 可选保存数据
+            char saveData;
+            cout << "是否保存模拟数据到CSV？(y/n，默认n)：";
+            cin >> saveData;
+            if (saveData == 'y' || saveData == 'Y') {
+                DataLoader::saveToCSV(allData, "regression_data_v2.csv");
+            }
+        }
+        else {
+            string filename;
+            bool skipHeader;
+            cout << "输入CSV文件路径：";
+            cin >> filename;
+            cout << "CSV是否带表头？(1-是  0-否，默认1)：";
+            cin >> skipHeader;
+            allData = DataLoader::loadCSV(filename, ',', skipHeader);
+        }
+
+        // 第二步：划分训练/测试集（优化：固定种子的shuffle，可复现）
+        LOG_INFO("【第二步：划分训练/测试集】");
+        double trainRatio = 0.8;
+        cout << "输入训练集比例（0-1，默认0.8）：";
+        if (!(cin >> trainRatio) || trainRatio <= 0 || trainRatio >= 1) trainRatio = 0.8;
+
+        // 固定种子的随机打乱（可复现）
+        mt19937 gen(RANDOM_SEED);
+        shuffle(allData.begin(), allData.end(), gen);
+        size_t splitIdx = static_cast<size_t>(allData.size() * trainRatio);
+        vector<DataPoint> trainData(allData.begin(), allData.begin() + splitIdx);
+        vector<DataPoint> testData(allData.begin() + splitIdx, allData.end());
+
+        LOG_INFO("总样本数：" << allData.size() << "，训练集：" << trainData.size() << "，测试集：" << testData.size());
+
+        // 第三步：训练线性回归模型（适配新增参数：优化方法、正则化）
+        LOG_INFO("【第三步：训练线性回归模型】");
+        char useGD, doNorm;
+        double l2Lambda = 0.001;
+        cout << "是否使用梯度下降？(y/n，n=正规方程，默认n)：";
+        cin >> useGD;
+        cout << "是否进行数据标准化？(y/n，默认y，梯度下降强制标准化）：";
+        cin >> doNorm;
+        cout << "输入L2正则化系数（≥0，默认0.001，0=普通线性回归）：";
+        if (!(cin >> l2Lambda) || l2Lambda < 0) l2Lambda = 0.001;
+
+        LinearRegression lr(useGD == 'y' || useGD == 'Y', 0.01, 2000, l2Lambda);
+        LOG_INFO("开始训练线性回归模型（优化方法：" << (useGD == 'y' ? "梯度下降" : "正规方程") << "，L2λ=" << l2Lambda << "）");
+        auto start = chrono::high_resolution_clock::now();
+        lr.train(trainData, doNorm == 'y' || doNorm == 'Y');
+        auto end = chrono::high_resolution_clock::now();
+        auto dur = chrono::duration_cast<chrono::milliseconds>(end - start);
+        LOG_INFO("线性回归训练完成，耗时：" << dur.count() << " 毫秒");
+
+        // 评估线性回归
+        auto lrMetrics = RegressionEvaluator::evaluate(lr, testData);
+        RegressionEvaluator::printMetrics(lrMetrics);
+        RegressionEvaluator::analyzeResiduals(lrMetrics);
+
+        // 第四步：训练多项式回归模型（适配新增参数：正则化）
+        LOG_INFO("【第四步：训练多项式回归模型】");
+        int polyDeg = 2;
+        cout << "\n输入多项式回归阶数（≥1，默认2）：";
+        if (!(cin >> polyDeg) || polyDeg < 1) polyDeg = 2;
+        cout << "输入多项式回归L2正则化系数（≥0，默认0.001）：";
+        if (!(cin >> l2Lambda) || l2Lambda < 0) l2Lambda = 0.001;
+
+        PolynomialRegression pr(polyDeg, l2Lambda);
+        LOG_INFO("开始训练多项式回归模型（阶数=" << polyDeg << "，L2λ=" << l2Lambda << "）");
+        start = chrono::high_resolution_clock::now();
+        pr.train(trainData);
+        end = chrono::high_resolution_clock::now();
+        dur = chrono::duration_cast<chrono::milliseconds>(end - start);
+        LOG_INFO("多项式回归训练完成，耗时：" << dur.count() << " 毫秒");
+
+        // 评估多项式回归
+        auto prMetrics = RegressionEvaluator::evaluate(pr, testData);
+        RegressionEvaluator::printMetrics(prMetrics);
+        RegressionEvaluator::analyzeResiduals(prMetrics);
+
+        // 第五步：训练Logistic回归（新增）
+        LOG_INFO("【第五步：训练Logistic回归模型】");
+        double logL2Lambda = 0.001;
+        cout << "\n输入Logistic回归L2正则化系数（≥0，默认0.001）：";
+        if (!(cin >> logL2Lambda) || logL2Lambda < 0) logL2Lambda = 0.001;
+
+        LogisticRegression logr(0.01, 2000, logL2Lambda);
+        LOG_INFO("开始训练Logistic回归模型（L2λ=" << logL2Lambda << "）");
+        start = chrono::high_resolution_clock::now();
+        logr.train(trainData);
+        end = chrono::high_resolution_clock::now();
+        dur = chrono::duration_cast<chrono::milliseconds>(end - start);
+        LOG_INFO("Logistic回归训练完成，耗时：" << dur.count() << " 毫秒");
+
+        // Logistic分类评估
+        cout << "\n==================================== Logistic回归评估结果 ====================================" << endl;
+        double acc = logr.score(testData);
+        int tp = 0, tn = 0, fp = 0, fn = 0;
+        for (const auto& p : testData) {
+            double prob = logr.predict(p.features);
+            int pred = (prob >= 0.5) ? 1 : 0;
+            int actual = static_cast<int>(round(p.target));
+            if (actual == 1 && pred == 1) tp++;
+            else if (actual == 0 && pred == 0) tn++;
+            else if (actual == 0 && pred == 1) fp++;
+            else fn++;
+        }
+        double precision = (tp + fp == 0) ? 0.0 : static_cast<double>(tp) / (tp + fp);
+        double recall = (tp + fn == 0) ? 0.0 : static_cast<double>(tp) / (tp + fn);
+        double f1 = (precision + recall == 0) ? 0.0 : 2 * precision * recall / (precision + recall);
+
+        cout << "准确率 (Accuracy)： " << fixed << setprecision(4) << acc * 100 << "%" << endl;
+        cout << "精确率 (Precision)： " << precision * 100 << "%" << endl;
+        cout << "召回率 (Recall)：   " << recall * 100 << "%" << endl;
+        cout << "F1 分数：           " << f1 * 100 << "%" << endl;
+        cout << "\n混淆矩阵：" << endl;
+        cout << "          预测0   预测1" << endl;
+        cout << "实际0     " << tn << "      " << fp << endl;
+        cout << "实际1     " << fn << "      " << tp << endl;
+        LOG_INFO("Logistic回归评估完成");
+
+        // 第六步：模型性能对比（3个模型）
+        LOG_INFO("【第六步：模型性能对比】");
+        cout << "\n==================================== 模型对比结果 ====================================" << endl;
+        cout << "线性回归     R²_adj = " << lrMetrics.adjR2 << endl;
+        cout << "多项式回归   R²_adj = " << prMetrics.adjR2 << endl;
+        cout << "Logistic回归 Accuracy = " << acc * 100 << "%" << endl;
+        cout << "=====================================================================================" << endl;
+
+        if (acc > 0.85) {
+            LOG_INFO("结论：Logistic回归表现最优（适合你的0/1数据）");
+        }
+        else if (acc > 0.7) {
+            LOG_INFO("结论：Logistic回归良好");
+        }
+        else {
+            LOG_INFO("结论：需检查数据或增加特征");
+        }
+        // 第六步：自定义预测
+        LOG_INFO("【第六步：模型预测】");
+        char doPredict;
+        cout << "\n是否进行自定义预测？(y/n，默认n)：";
+        cin >> doPredict;
+        if (doPredict == 'y' || doPredict == 'Y') {
+            int nFeats = trainData[0].features.size();
+            vector<double> customFeat(nFeats);
+            cout << "请输入" << nFeats << "个特征值（空格分隔）：";
+            for (int i = 0; i < nFeats; ++i) {
+                cin >> customFeat[i];
+            }
+
+            double lrPred = lr.predict(customFeat);
+            double prPred = pr.predict(customFeat);
+            cout << "\n==================================== 自定义预测结果 ====================================" << endl;
+            cout << "线性回归预测值：" << fixed << setprecision(6) << lrPred << endl;
+            cout << polyDeg << "阶多项式回归预测值：" << fixed << setprecision(6) << prPred << endl;
+            cout << "=====================================================================================" << endl;
+        }
+
+        // 第七步：保存结果
+        LOG_INFO("【第七步：结果保存】");
+        char saveResult;
+        cout << "\n是否保存模型系数和评估结果到文件？(y/n，默认n）：";
+        cin >> saveResult;
+        if (saveResult == 'y' || saveResult == 'Y') {
+            ofstream fout(R"(C:\Users\yang\Desktop\regression_results_v2.txt)");
+            if (fout.is_open()) {
+                fout << fixed << setprecision(6);
+                fout << "C++ 回归分析系统优化版 V2.0 结果" << endl;
+                fout << "生成时间：" << getCurrentTime() << endl;
+                fout << "总样本数：" << allData.size() << "，训练集：" << trainData.size() << "，测试集：" << testData.size() << endl;
+
+                fout << "\n【线性回归模型】" << endl;
+                fout << "优化方法：" << (useGD == 'y' ? "梯度下降" : "正规方程") << endl;
+                fout << "L2正则化系数：" << l2Lambda << endl;
+                fout << "截距：" << lr.getIntercept() << endl;
+                fout << "系数：";
+                for (double c : lr.getCoefficients()) fout << c << " ";
+                fout << endl;
+                fout << "基础R²：" << lrMetrics.r2 << "，调整R²：" << lrMetrics.adjR2 << "，RMSE：" << lrMetrics.rmse << endl;
+
+                fout << "\n【多项式回归模型】" << endl;
+                fout << "阶数：" << polyDeg << endl;
+                fout << "L2正则化系数：" << l2Lambda << endl;
+                fout << "基础R²：" << prMetrics.r2 << "，调整R²：" << prMetrics.adjR2 << "，RMSE：" << prMetrics.rmse << endl;
+
+                fout << "\n【Logistic 回归模型（分类结果）】" << endl;
+                fout << "L2正则化系数：" << logL2Lambda << endl;
+                fout << "准确率：" << acc * 100 << "%" << endl;
+                fout << "精确率：" << precision * 100 << "%" << endl;
+                fout << "召回率：" << recall * 100 << "%" << endl;
+                fout << "F1分数：" << f1 * 100 << "%" << endl;
+
+                fout << "\n混淆矩阵：" << endl;
+                fout << "          预测0   预测1" << endl;
+                fout << "实际0     " << tn << "      " << fp << endl;
+                fout << "实际1     " << fn << "      " << tp << endl;
+                fout << "\n【评估指标对比】" << endl;
+                fout << "模型\t\tMSE\t\tRMSE\t\tMAE\t\tMAPE(%)\t\tR²\t\tR²_adj" << endl;
+                fout << "线性回归\t" << lrMetrics.mse << "\t" << lrMetrics.rmse << "\t" << lrMetrics.mae << "\t" << lrMetrics.mape << "\t" << lrMetrics.r2 << "\t" << lrMetrics.adjR2 << endl;
+                fout << polyDeg << "阶多项式\t" << prMetrics.mse << "\t" << prMetrics.rmse << "\t" << prMetrics.mae << "\t" << prMetrics.mape << "\t" << prMetrics.r2 << "\t" << prMetrics.adjR2 << endl;
+                fout.close();
+                LOG_INFO("结果已保存到：regression_results_v2.txt");
+            }
+            else {
+                LOG_ERROR("无法创建结果文件");
+            }
+        }
+
+        LOG_INFO("回归分析流程全部完成！感谢使用！");
+    }
+    catch (const exception& e) {
+        LOG_ERROR("程序异常终止：" << e.what());
+        return 1;
+    }
+    catch (...) {
+        LOG_ERROR("发生未知异常");
+        return 1;
+    }
+
+    return 0;
+}
+
+    
